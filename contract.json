@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ztna-hackathon.local/schemas/network-anomaly.json",
+  "title": "Network Anomaly Event",
+  "description": "Strict schema definition for network flow anomalies identified by the local Isolation Forest agent.",
+  "type": "object",
+  "required": [
+    "timestamp",
+    "src_ip",
+    "dst_ip",
+    "protocol",
+    "byte_count",
+    "threat_score",
+    "anomaly_flag",
+    "suggested_action"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 formatted timestamp of when the anomalous network event originated."
+    },
+    "src_ip": {
+      "type": "string",
+      "anyOf": [
+        { "format": "ipv4" },
+        { "format": "ipv6" }
+      ],
+      "description": "The IP address of the communication source."
+    },
+    "dst_ip": {
+      "type": "string",
+      "anyOf": [
+        { "format": "ipv4" },
+        { "format": "ipv6" }
+      ],
+      "description": "The IP address of the communication destination."
+    },
+    "protocol": {
+      "type": "string",
+      "enum": ["TCP", "UDP", "ICMP", "HTTP", "HTTPS", "DNS", "TLS", "UNKNOWN"],
+      "description": "The normalized network or transport protocol identified during flow extraction."
+    },
+    "byte_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total bytes transferred in the specific payload or flow window. Cannot be negative."
+    },
+    "threat_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Normalized anomaly score derived from the Scikit-learn Isolation Forest model. 0 represents benign traffic; 100 represents highest statistical confidence of an anomaly."
+    },
+    "anomaly_flag": {
+      "type": "boolean",
+      "description": "A discrete boolean flag denoting whether the threat_score breached the predefined dynamic threshold for immediate triage."
+    },
+    "suggested_action": {
+      "type": "string",
+      "enum": ["ALLOW", "MONITOR", "BLOCK", "QUARANTINE_DEVICE", "REQUIRE_STEP_UP_AUTH"],
+      "description": "The localized recommendation formulated by the edge agent for ingestion by the central Policy Decision Point."
+    }
+  }
+}

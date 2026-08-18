@@ -1,0 +1,24 @@
+backend:
+  url: "https://YOUR-REMOTE-BACKEND-URL/api/alerts"
+  timeout_seconds: 5
+
+sniffer:
+  mode: "simulation"
+  interface: null
+  batch_size: 50
+  batch_sleep_seconds: 0.05
+  max_packet_size: 65535
+
+model:
+  path: "models/isolation_forest.joblib"
+
+  contamination: 0.05
+  n_estimators: 200
+  random_state: 42
+  score_scale: 3.0
+
+actions:
+  monitor_threshold: 25
+  step_up_threshold: 50
+  block_threshold: 75
+  quarantine_threshold: 90

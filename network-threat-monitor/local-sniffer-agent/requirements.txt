@@ -1,0 +1,7 @@
+scapy
+requests
+scikit-learn
+numpy
+joblib
+PyYAML
+python-dotenv
