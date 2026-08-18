@@ -6,7 +6,7 @@ Zero-Trust local network traffic sniffer.
 Modes:
     simulation
         Used for development/testing in GitHub Codespaces.
-        Generates realistic-looking network feature data.
+        Generates simulated network feature data.
 
     live
         Uses Scapy to capture real network packets.
@@ -44,22 +44,12 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Feature extraction
+# Protocol handling
 # ---------------------------------------------------------------------------
 
 def get_protocol(packet) -> str:
     """
-    Convert Scapy packet layers into a protocol supported by contract.json.
-
-    Supported contract values:
-        TCP
-        UDP
-        ICMP
-        HTTP
-        HTTPS
-        DNS
-        TLS
-        UNKNOWN
+    Convert Scapy layers into a protocol supported by contract.json.
     """
 
     if packet.haslayer(TCP):
@@ -78,18 +68,15 @@ def extract_ips(
     packet,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
-    Extract source and destination IP addresses.
-    Supports IPv4 and IPv6.
+    Extract source and destination IPv4/IPv6 addresses.
     """
 
     if packet.haslayer(IP):
         layer = packet[IP]
-
         return layer.src, layer.dst
 
     if packet.haslayer(IPv6):
         layer = packet[IPv6]
-
         return layer.src, layer.dst
 
     return None, None
@@ -99,31 +86,30 @@ def extract_ports(
     packet,
 ) -> Tuple[Optional[int], Optional[int]]:
     """
-    Extract source and destination ports.
-
-    TCP/UDP have ports.
-    ICMP and other protocols return None.
+    Extract source and destination ports for TCP/UDP traffic.
     """
 
     if packet.haslayer(TCP):
         layer = packet[TCP]
-
         return int(layer.sport), int(layer.dport)
 
     if packet.haslayer(UDP):
         layer = packet[UDP]
-
         return int(layer.sport), int(layer.dport)
 
     return None, None
 
 
+# ---------------------------------------------------------------------------
+# Feature extraction
+# ---------------------------------------------------------------------------
+
 def extract_features(
     packet,
 ) -> Optional[Dict[str, Any]]:
     """
-    Convert a real Scapy packet into the numerical features expected
-    by isolation_forest.py.
+    Convert a real packet into the feature vector expected by
+    isolation_forest.py.
     """
 
     src_ip, dst_ip = extract_ips(packet)
@@ -147,13 +133,9 @@ def extract_features(
 
 def generate_simulated_features() -> Dict[str, Any]:
     """
-    Generate development-only network features.
+    Generate development-only traffic features.
 
-    This does NOT capture real network traffic.
-
-    It allows the complete:
-        sniffer → ML → emitter → backend
-    pipeline to be tested inside Codespaces.
+    This is NOT real packet capture.
     """
 
     protocols = [
@@ -181,17 +163,16 @@ def generate_simulated_features() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Policy
+# Action policy
 # ---------------------------------------------------------------------------
 
 def choose_action(
     threat_score: float,
 ) -> str:
     """
-    Convert threat score into one of the actions allowed by contract.json.
+    Convert threat score to a contract-supported action.
 
-    These thresholds are application policy and are NOT defined
-    by contract.json itself.
+    These thresholds are application policy, not part of the JSON contract.
     """
 
     if threat_score >= 90:
@@ -210,14 +191,12 @@ def choose_action(
 
 
 # ---------------------------------------------------------------------------
-# NetworkSniffer
+# Network sniffer
 # ---------------------------------------------------------------------------
 
 class NetworkSniffer:
     """
-    Main network monitoring class.
-
-    Handles both simulation and real Scapy capture.
+    Handles simulation and live Scapy packet capture.
     """
 
     def __init__(
@@ -227,7 +206,6 @@ class NetworkSniffer:
         batch_sleep_seconds: float = 0.05,
         interface: Optional[str] = None,
         model_path: str = "models/isolation_forest.joblib",
-        score_scale: float = 3.0,
         mode: str = "simulation",
     ):
         self.emitter = emitter
@@ -246,16 +224,23 @@ class NetworkSniffer:
 
         self.mode = mode.lower().strip()
 
-        if self.mode not in {"simulation", "live"}:
+        if self.mode not in {
+            "simulation",
+            "live",
+        }:
             raise ValueError(
-                "sniffer.mode must be either "
+                "sniffer.mode must be "
                 "'simulation' or 'live'."
             )
 
-        # Load the Isolation Forest once.
+        # -------------------------------------------------------------------
+        # IMPORTANT:
+        # initialize() now only accepts model_path.
+        # Threat-score calibration is loaded from the trained model bundle.
+        # -------------------------------------------------------------------
+
         initialize(
             model_path=model_path,
-            score_scale=score_scale,
         )
 
         self.packets_seen = 0
@@ -263,7 +248,7 @@ class NetworkSniffer:
         self.anomalies_detected = 0
 
     # -----------------------------------------------------------------------
-    # Common ML processing
+    # ML analysis
     # -----------------------------------------------------------------------
 
     def analyze_features(
@@ -273,9 +258,7 @@ class NetworkSniffer:
         dst_ip: Optional[str] = None,
     ) -> None:
         """
-        Run Isolation Forest on a feature set.
-
-        This method is shared by both simulation and live modes.
+        Run the feature vector through the Isolation Forest.
         """
 
         self.packets_seen += 1
@@ -311,8 +294,7 @@ class NetworkSniffer:
                 threat_score
             )
 
-            # Simulation mode needs example IPs because no real packet
-            # exists from which to extract addresses.
+            # Simulation doesn't have real IP addresses.
             if src_ip is None:
                 src_ip = "192.168.1.100"
 
@@ -380,14 +362,12 @@ class NetworkSniffer:
             )
 
     # -----------------------------------------------------------------------
-    # Simulation
+    # Simulation mode
     # -----------------------------------------------------------------------
 
     def start_simulation(self) -> None:
         """
         Start development simulation.
-
-        Useful in Codespaces where raw packet capture is unavailable.
         """
 
         logger.warning(
@@ -404,7 +384,9 @@ class NetworkSniffer:
 
         while True:
             try:
-                features = generate_simulated_features()
+                features = (
+                    generate_simulated_features()
+                )
 
                 self.analyze_features(
                     features=features,
@@ -428,14 +410,12 @@ class NetworkSniffer:
                 time.sleep(1.0)
 
     # -----------------------------------------------------------------------
-    # Live Scapy capture
+    # Live Scapy mode
     # -----------------------------------------------------------------------
 
     def start_live(self) -> None:
         """
         Start real network packet capture.
-
-        This requires appropriate OS/container packet-capture privileges.
         """
 
         logger.info(
@@ -461,7 +441,6 @@ class NetworkSniffer:
                     store=False,
                 )
 
-                # Small CPU yield after each batch.
                 time.sleep(
                     self.batch_sleep_seconds
                 )
@@ -474,9 +453,8 @@ class NetworkSniffer:
 
             except PermissionError:
                 logger.error(
-                    "Permission denied while opening the network "
-                    "capture socket. Run the agent on a machine/container "
-                    "with packet-capture privileges."
+                    "Permission denied while opening "
+                    "the network capture socket."
                 )
                 break
 
@@ -488,12 +466,12 @@ class NetworkSniffer:
                 time.sleep(1.0)
 
     # -----------------------------------------------------------------------
-    # Entry point
+    # Main entry point
     # -----------------------------------------------------------------------
 
     def start(self) -> None:
         """
-        Start the selected mode.
+        Start simulation or live capture.
         """
 
         logger.info(

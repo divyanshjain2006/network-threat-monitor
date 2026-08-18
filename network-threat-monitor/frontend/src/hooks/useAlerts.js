@@ -1,14 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+
 import { getAlertSocket } from "../services/alertSocket";
 
-const BACKEND_URL =
-  import.meta.env.VITE_BACKEND_URL || "http://localhost:5000";
-
-const MAX_ALERTS = 500;
-
-/**
- * Fields permitted by contract.json.
- */
 const CONTRACT_FIELDS = [
   "timestamp",
   "src_ip",
@@ -20,12 +18,8 @@ const CONTRACT_FIELDS = [
   "suggested_action",
 ];
 
-/**
- * Keep only fields defined by contract.json.
- *
- * This prevents UI state from accidentally becoming a different
- * data contract if the backend later adds unrelated properties.
- */
+const MAX_ALERTS = 500;
+
 const normalizeAlert = (alert) => {
   if (!alert || typeof alert !== "object") {
     return null;
@@ -34,7 +28,12 @@ const normalizeAlert = (alert) => {
   const normalized = {};
 
   for (const field of CONTRACT_FIELDS) {
-    if (Object.prototype.hasOwnProperty.call(alert, field)) {
+    if (
+      Object.prototype.hasOwnProperty.call(
+        alert,
+        field
+      )
+    ) {
       normalized[field] = alert[field];
     }
   }
@@ -42,18 +41,8 @@ const normalizeAlert = (alert) => {
   return normalized;
 };
 
-/**
- * Creates a stable identifier for deduplication.
- *
- * The contract itself does not define an ID, so the identifier is generated
- * locally from the immutable alert fields.
- */
-const createAlertKey = (alert) => {
-  if (!alert) {
-    return "";
-  }
-
-  return [
+const alertKey = (alert) =>
+  [
     alert.timestamp,
     alert.src_ip,
     alert.dst_ip,
@@ -63,81 +52,77 @@ const createAlertKey = (alert) => {
     alert.anomaly_flag,
     alert.suggested_action,
   ].join("|");
-};
 
 export const useAlerts = () => {
   const [alerts, setAlerts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const alertKeysRef = useRef(new Set());
 
-  /**
-   * Add an alert without introducing duplicates.
-   */
+  const keysRef = useRef(new Set());
+
   const appendAlert = useCallback((incomingAlert) => {
-    const normalizedAlert = normalizeAlert(incomingAlert);
+    const alert = normalizeAlert(incomingAlert);
 
-    if (!normalizedAlert) {
+    if (!alert) {
       return;
     }
 
-    const alertKey = createAlertKey(normalizedAlert);
+    const key = alertKey(alert);
 
-    if (!alertKey || alertKeysRef.current.has(alertKey)) {
+    if (keysRef.current.has(key)) {
       return;
     }
 
-    alertKeysRef.current.add(alertKey);
+    keysRef.current.add(key);
 
     setAlerts((currentAlerts) => {
-      const nextAlerts = [normalizedAlert, ...currentAlerts];
+      const nextAlerts = [
+        alert,
+        ...currentAlerts,
+      ];
 
-      if (nextAlerts.length > MAX_ALERTS) {
-        const removedAlerts = nextAlerts.slice(MAX_ALERTS);
-
-        removedAlerts.forEach((alert) => {
-          alertKeysRef.current.delete(createAlertKey(alert));
-        });
-
-        return nextAlerts.slice(0, MAX_ALERTS);
-      }
-
-      return nextAlerts;
+      return nextAlerts.slice(0, MAX_ALERTS);
     });
   }, []);
 
-  /**
-   * Load historical alerts from REST API.
+  /*
+   * Initial alert history.
+   *
+   * IMPORTANT:
+   * This is intentionally relative:
+   *
+   *     /api/alerts
+   *
+   * Vite proxies it to:
+   *
+   *     http://127.0.0.1:5000/api/alerts
    */
   useEffect(() => {
     let cancelled = false;
 
-    const fetchAlerts = async () => {
+    const loadAlerts = async () => {
       try {
         setLoading(true);
         setError(null);
 
-        const response = await fetch(`${BACKEND_URL}/api/alerts`);
+        const response = await fetch(
+          "/api/alerts"
+        );
 
         if (!response.ok) {
           throw new Error(
-            `Failed to fetch alerts: HTTP ${response.status}`
+            `Backend returned HTTP ${response.status}`
           );
         }
 
         const result = await response.json();
 
-        /**
-         * Supports:
-         * { data: [...] }
-         * or
-         * [...]
-         */
-        const receivedAlerts = Array.isArray(result)
-          ? result
-          : Array.isArray(result.data)
-            ? result.data
-            : [];
+        const serverAlerts =
+          Array.isArray(result)
+            ? result
+            : Array.isArray(result.data)
+              ? result.data
+              : [];
 
         if (cancelled) {
           return;
@@ -146,16 +131,17 @@ export const useAlerts = () => {
         const normalizedAlerts = [];
         const keys = new Set();
 
-        for (const rawAlert of receivedAlerts) {
-          const alert = normalizeAlert(rawAlert);
+        for (const rawAlert of serverAlerts) {
+          const alert =
+            normalizeAlert(rawAlert);
 
           if (!alert) {
             continue;
           }
 
-          const key = createAlertKey(alert);
+          const key = alertKey(alert);
 
-          if (!key || keys.has(key)) {
+          if (keys.has(key)) {
             continue;
           }
 
@@ -163,12 +149,25 @@ export const useAlerts = () => {
           normalizedAlerts.push(alert);
         }
 
-        alertKeysRef.current = keys;
-        setAlerts(normalizedAlerts.slice(0, MAX_ALERTS));
+        keysRef.current = keys;
+
+        setAlerts(
+          normalizedAlerts.slice(
+            0,
+            MAX_ALERTS
+          )
+        );
       } catch (fetchError) {
         if (!cancelled) {
-          console.error("Failed to load alerts:", fetchError);
-          setError(fetchError.message || "Unable to load alerts.");
+          console.error(
+            "Failed to load alerts:",
+            fetchError
+          );
+
+          setError(
+            fetchError.message ||
+              "Unable to load alerts."
+          );
         }
       } finally {
         if (!cancelled) {
@@ -177,15 +176,15 @@ export const useAlerts = () => {
       }
     };
 
-    fetchAlerts();
+    loadAlerts();
 
     return () => {
       cancelled = true;
     };
   }, []);
 
-  /**
-   * Subscribe to real-time anomaly events.
+  /*
+   * Real-time Socket.io alerts.
    */
   useEffect(() => {
     const socket = getAlertSocket();
@@ -194,10 +193,16 @@ export const useAlerts = () => {
       appendAlert(incomingAlert);
     };
 
-    socket.on("new_alert", handleNewAlert);
+    socket.on(
+      "new_alert",
+      handleNewAlert
+    );
 
     return () => {
-      socket.off("new_alert", handleNewAlert);
+      socket.off(
+        "new_alert",
+        handleNewAlert
+      );
     };
   }, [appendAlert]);
 
@@ -205,7 +210,6 @@ export const useAlerts = () => {
     alerts,
     loading,
     error,
-    alertCount: alerts.length,
   };
 };
 

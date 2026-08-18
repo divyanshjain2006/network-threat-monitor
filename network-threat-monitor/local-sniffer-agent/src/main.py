@@ -34,18 +34,19 @@ logger = logging.getLogger(__name__)
 
 def load_config() -> dict:
     """
-    Load config.yaml from the local-sniffer-agent directory.
-
-    main.py is inside src/, therefore:
-        Path(__file__).parent.parent
-    points to local-sniffer-agent/
+    Load config.yaml from local-sniffer-agent/.
     """
 
-    project_root = Path(
-        __file__
-    ).resolve().parent.parent
+    project_root = (
+        Path(__file__)
+        .resolve()
+        .parent
+        .parent
+    )
 
-    config_path = project_root / "config.yaml"
+    config_path = (
+        project_root / "config.yaml"
+    )
 
     if not config_path.exists():
         raise FileNotFoundError(
@@ -58,6 +59,11 @@ def load_config() -> dict:
     ) as file:
         config = yaml.safe_load(file)
 
+    if not isinstance(config, dict):
+        raise ValueError(
+            "config.yaml must contain a YAML object."
+        )
+
     return config
 
 
@@ -68,13 +74,12 @@ def load_config() -> dict:
 def main() -> None:
     config = load_config()
 
-    project_root = Path(
-        __file__
-    ).resolve().parent.parent
-
-    # -----------------------------------------------------------------------
-    # Read configuration
-    # -----------------------------------------------------------------------
+    project_root = (
+        Path(__file__)
+        .resolve()
+        .parent
+        .parent
+    )
 
     backend_config = config.get(
         "backend",
@@ -92,7 +97,7 @@ def main() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # Resolve model path
+    # Model path
     # -----------------------------------------------------------------------
 
     configured_model_path = model_config.get(
@@ -105,19 +110,23 @@ def main() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # Initialize ML engine
+    # Model initialization
+    # -----------------------------------------------------------------------
+    #
+    # IMPORTANT:
+    # The current isolation_forest.initialize()
+    # does NOT accept score_scale.
+    #
+    # Score calibration is now loaded from the trained
+    # model bundle itself.
     # -----------------------------------------------------------------------
 
     initialize(
         model_path=str(model_path),
-        score_scale=model_config.get(
-            "score_scale",
-            3.0,
-        ),
     )
 
     # -----------------------------------------------------------------------
-    # Initialize backend emitter
+    # Backend emitter
     # -----------------------------------------------------------------------
 
     emitter = AlertEmitter(
@@ -128,7 +137,7 @@ def main() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # Initialize sniffer
+    # Sniffer
     # -----------------------------------------------------------------------
 
     sniffer = NetworkSniffer(
@@ -150,11 +159,6 @@ def main() -> None:
 
         model_path=str(model_path),
 
-        score_scale=model_config.get(
-            "score_scale",
-            3.0,
-        ),
-
         mode=sniffer_config.get(
             "mode",
             "simulation",
@@ -162,7 +166,7 @@ def main() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # Start
+    # Startup
     # -----------------------------------------------------------------------
 
     logger.info(
