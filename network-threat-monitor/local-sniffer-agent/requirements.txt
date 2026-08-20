@@ -5,3 +5,4 @@ numpy
 joblib
 PyYAML
 python-dotenv
+python-socketio[client]

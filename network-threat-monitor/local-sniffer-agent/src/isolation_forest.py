@@ -1,12 +1,25 @@
 """
 isolation_forest.py
 
-Runtime inference engine for the Zero-Trust edge agent.
+Loads the trained Isolation Forest and converts flow features into:
+
+    anomaly_flag
+    threat_score
+
+The important design decision is:
+
+    anomaly_flag
+        comes from Isolation Forest's binary decision.
+
+    threat_score
+        comes from the raw decision_function() value and the calibrated
+        normal score range saved by train_model.py.
+
+This prevents every anomaly from becoming threat_score = 100.
 """
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Any, Dict
 
@@ -14,260 +27,393 @@ import joblib
 import numpy as np
 
 
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Global model state
+# ---------------------------------------------------------------------------
+
+_MODEL = None
+_SCALER = None
+_FEATURE_NAMES = None
+_PROTOCOL_TO_ID = None
+
+_NORMAL_SCORE_LOW = None
+_NORMAL_SCORE_HIGH = None
+
+_INITIALIZED = False
 
 
-DEFAULT_MODEL_PATH = (
-    "models/isolation_forest.joblib"
-)
+# ---------------------------------------------------------------------------
+# Initialization
+# ---------------------------------------------------------------------------
 
+def initialize(
+    model_path: str | Path,
+) -> None:
+    """
+    Load the trained Isolation Forest bundle.
 
-PROTOCOL_TO_ID = {
-    "UNKNOWN": 0,
-    "TCP": 1,
-    "UDP": 2,
-    "ICMP": 3,
-    "HTTP": 4,
-    "HTTPS": 5,
-    "DNS": 6,
-    "TLS": 7,
-}
+    Expected saved keys:
 
+        model
+        scaler
+        feature_names
+        protocol_to_id
+        normal_score_low
+        normal_score_high
+    """
 
-class IsolationForestEngine:
+    global _MODEL
+    global _SCALER
+    global _FEATURE_NAMES
+    global _PROTOCOL_TO_ID
+    global _NORMAL_SCORE_LOW
+    global _NORMAL_SCORE_HIGH
+    global _INITIALIZED
 
-    def __init__(
-        self,
-        model_path: str = DEFAULT_MODEL_PATH,
+    if _INITIALIZED:
+        return
+
+    model_path = Path(
+        model_path
+    )
+
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Model file not found: {model_path}"
+        )
+
+    bundle = joblib.load(
+        model_path
+    )
+
+    required_keys = {
+        "model",
+        "scaler",
+        "feature_names",
+        "protocol_to_id",
+        "normal_score_low",
+        "normal_score_high",
+    }
+
+    missing = (
+        required_keys
+        - set(bundle.keys())
+    )
+
+    if missing:
+        raise ValueError(
+            "Invalid Isolation Forest model bundle. "
+            f"Missing keys: {sorted(missing)}"
+        )
+
+    _MODEL = bundle["model"]
+    _SCALER = bundle["scaler"]
+    _FEATURE_NAMES = list(
+        bundle["feature_names"]
+    )
+    _PROTOCOL_TO_ID = dict(
+        bundle["protocol_to_id"]
+    )
+
+    _NORMAL_SCORE_LOW = float(
+        bundle["normal_score_low"]
+    )
+
+    _NORMAL_SCORE_HIGH = float(
+        bundle["normal_score_high"]
+    )
+
+    if (
+        _NORMAL_SCORE_HIGH
+        <= _NORMAL_SCORE_LOW
     ):
-        self.model_path = Path(
-            model_path
+        raise ValueError(
+            "Invalid calibrated normal-score range: "
+            "normal_score_high must be greater than "
+            "normal_score_low."
         )
 
-        self.model = None
-        self.scaler = None
+    _INITIALIZED = True
 
-        self.score_low = -0.5
-        self.score_high = 0.5
 
-        self.protocol_to_id = (
-            PROTOCOL_TO_ID.copy()
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def _ensure_initialized() -> None:
+    if not _INITIALIZED:
+        raise RuntimeError(
+            "Isolation Forest is not initialized. "
+            "Call initialize(model_path=...) first."
         )
 
-        self._load_model()
 
-    def _load_model(self) -> None:
+# ---------------------------------------------------------------------------
+# Protocol encoding
+# ---------------------------------------------------------------------------
 
-        if not self.model_path.exists():
-            raise FileNotFoundError(
-                f"Model not found: "
-                f"{self.model_path}\n"
-                "Run train_model.py first."
-            )
+def _encode_protocol(
+    protocol: str,
+) -> float:
+    """
+    Convert a protocol string into the numeric value used during training.
+    """
 
-        logger.info(
-            "Loading Isolation Forest model "
-            "from %s",
-            self.model_path,
-        )
+    normalized = (
+        str(protocol)
+        .strip()
+        .upper()
+    )
 
-        bundle = joblib.load(
-            self.model_path
-        )
-
-        self.model = bundle["model"]
-        self.scaler = bundle["scaler"]
-
-        self.score_low = float(
-            bundle.get(
-                "normal_score_low",
-                -0.5,
-            )
-        )
-
-        self.score_high = float(
-            bundle.get(
-                "normal_score_high",
-                0.5,
+    if normalized not in _PROTOCOL_TO_ID:
+        return float(
+            _PROTOCOL_TO_ID.get(
+                "UNKNOWN",
+                -1,
             )
         )
 
-        self.protocol_to_id = bundle.get(
-            "protocol_to_id",
-            PROTOCOL_TO_ID,
-        )
+    return float(
+        _PROTOCOL_TO_ID[
+            normalized
+        ]
+    )
 
-        logger.info(
-            "Isolation Forest model loaded."
-        )
 
-    def _convert_features(
-        self,
-        features: Dict[str, Any],
-    ) -> np.ndarray:
+# ---------------------------------------------------------------------------
+# Feature vector
+# ---------------------------------------------------------------------------
 
-        packet_size = float(
-            features.get(
-                "packet_size",
+def _build_feature_vector(
+    features: Dict[str, Any],
+) -> np.ndarray:
+    """
+    Build the feature vector in EXACTLY the order stored in feature_names.
+    """
+
+    values = []
+
+    for name in _FEATURE_NAMES:
+
+        if name == "protocol_id":
+
+            value = _encode_protocol(
+                features.get(
+                    "protocol",
+                    "UNKNOWN",
+                )
+            )
+
+        else:
+
+            raw_value = features.get(
+                name,
                 0,
             )
+
+            try:
+                value = float(
+                    raw_value
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                value = 0.0
+
+        values.append(value)
+
+    return np.asarray(
+        [values],
+        dtype=float,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Threat-score calibration
+# ---------------------------------------------------------------------------
+
+def _calibrate_threat_score(
+    raw_decision_score: float,
+) -> float:
+    """
+    Convert Isolation Forest decision_function() output into
+    a continuous 0-100 threat score.
+
+    Around the decision boundary:
+
+        raw >= 0
+            normal side
+
+        raw < 0
+            anomaly side
+
+    More negative values indicate stronger anomalies.
+    """
+
+    if _MODEL is None:
+        raise RuntimeError(
+            "Isolation Forest model is not loaded."
         )
 
-        protocol = features.get(
-            "protocol",
-            "UNKNOWN",
+    if raw_decision_score >= 0:
+        # Normal region.
+        normal_reference = max(
+            0.10,
+            abs(
+                float(
+                    _NORMAL_SCORE_HIGH
+                )
+            ),
         )
 
-        protocol_id = self.protocol_to_id.get(
-            protocol,
-            self.protocol_to_id[
-                "UNKNOWN"
-            ],
+        normalized = (
+            raw_decision_score
+            / normal_reference
         )
 
-        src_port = features.get(
-            "src_port"
-        )
-
-        dst_port = features.get(
-            "dst_port"
-        )
-
-        if src_port is None:
-            src_port = 0
-
-        if dst_port is None:
-            dst_port = 0
-
-        return np.asarray(
-            [
-                [
-                    packet_size,
-                    protocol_id,
-                    float(src_port),
-                    float(dst_port),
-                ]
-            ],
-            dtype=np.float64,
-        )
-
-    def _calculate_threat_score(
-        self,
-        decision_score: float,
-    ) -> float:
-        """
-        Convert the Isolation Forest decision score
-        into 0-100 threat score.
-
-        Higher anomaly → higher threat score.
-        """
-
-        # Normal scores occupy approximately:
-        #
-        #     score_low → score_high
-        #
-        # Lower scores are more suspicious.
-
-        if self.score_high <= self.score_low:
-            return 50.0
-
-        normalized_normality = (
-            decision_score - self.score_low
-        ) / (
-            self.score_high
-            - self.score_low
-        )
-
-        normalized_normality = max(
+        normalized = max(
             0.0,
             min(
                 1.0,
-                normalized_normality,
+                normalized,
             ),
         )
 
-        threat_score = (
-            1.0
-            - normalized_normality
-        ) * 100.0
-
-        return float(
-            max(
-                0.0,
-                min(
-                    100.0,
-                    threat_score,
-                ),
-            )
+        # Normal traffic occupies roughly 0-50.
+        score = (
+            50.0
+            * (1.0 - normalized)
         )
 
-    def predict(
-        self,
-        features: Dict[str, Any],
-    ) -> Dict[str, Any]:
-
-        vector = self._convert_features(
-            features
-        )
-
-        scaled_vector = self.scaler.transform(
-            vector
-        )
-
-        prediction = self.model.predict(
-            scaled_vector
-        )[0]
-
-        decision_score = float(
-            self.model.decision_function(
-                scaled_vector
-            )[0]
-        )
-
-        anomaly_flag = (
-            prediction == -1
-        )
-
-        threat_score = (
-            self._calculate_threat_score(
-                decision_score
-            )
-        )
-
-        return {
-            "anomaly_flag": bool(
-                anomaly_flag
+    else:
+        # Anomalous region.
+        anomaly_reference = max(
+            0.20,
+            abs(
+                float(
+                    _NORMAL_SCORE_LOW
+                )
             ),
-            "threat_score": threat_score,
-        }
-
-
-_engine = None
-
-
-def initialize(
-    model_path: str = DEFAULT_MODEL_PATH,
-) -> IsolationForestEngine:
-
-    global _engine
-
-    if _engine is None:
-        _engine = IsolationForestEngine(
-            model_path=model_path
         )
 
-    return _engine
+        normalized = (
+            abs(raw_decision_score)
+            / anomaly_reference
+        )
 
+        normalized = max(
+            0.0,
+            min(
+                1.0,
+                normalized,
+            ),
+        )
+
+        # Anomalous traffic occupies roughly 50-100.
+        score = (
+            50.0
+            + (
+                normalized
+                * 50.0
+            )
+        )
+
+    return round(
+        max(
+            0.0,
+            min(
+                100.0,
+                score,
+            )
+        ),
+        2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prediction
+# ---------------------------------------------------------------------------
 
 def predict(
     features: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """
+    Predict whether a network flow is anomalous.
 
-    global _engine
+    Returns:
 
-    if _engine is None:
-        _engine = IsolationForestEngine()
+        {
+            "anomaly_flag": bool,
+            "threat_score": float,
+            "raw_decision_score": float
+        }
+    """
 
-    return _engine.predict(
+    _ensure_initialized()
+
+    X = _build_feature_vector(
         features
     )
+
+    # ---------------------------------------------------------------
+    # Apply training scaler.
+    # ---------------------------------------------------------------
+
+    X_scaled = _SCALER.transform(
+        X
+    )
+
+    # ---------------------------------------------------------------
+    # Binary Isolation Forest decision.
+    #
+    # -1 = anomaly
+    # +1 = normal
+    # ---------------------------------------------------------------
+
+    prediction = int(
+        _MODEL.predict(
+            X_scaled
+        )[0]
+    )
+
+    anomaly_flag = (
+        prediction == -1
+    )
+
+    # ---------------------------------------------------------------
+    # Raw continuous score.
+    #
+    # Larger = more normal
+    # Smaller = more anomalous
+    # ---------------------------------------------------------------
+
+    raw_decision_score = float(
+        _MODEL.decision_function(
+            X_scaled
+        )[0]
+    )
+
+    # ---------------------------------------------------------------
+    # Calibrated 0-100 threat score.
+    # ---------------------------------------------------------------
+
+    threat_score = (
+        _calibrate_threat_score(
+            raw_decision_score
+        )
+    )
+
+    return {
+        "anomaly_flag":
+            anomaly_flag,
+
+        "threat_score":
+            threat_score,
+
+        "raw_decision_score":
+            round(
+                raw_decision_score,
+                6,
+            ),
+    }

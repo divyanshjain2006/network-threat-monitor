@@ -1,23 +1,27 @@
 """
 train_model.py
 
-Train the Isolation Forest model for the Zero-Trust edge agent.
+Train Isolation Forest using flow-level features.
 
 Feature vector:
 
-    packet_size
-    protocol_id
-    src_port
-    dst_port
+0  packet_count
+1  total_bytes
+2  average_packet_size
+3  packets_per_second
+4  bytes_per_second
+5  src_port
+6  dst_port
+7  unique_destinations
+8  unique_destination_ports
+9  protocol_id
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import logging
 from pathlib import Path
-from typing import List
 
 import joblib
 import numpy as np
@@ -46,72 +50,27 @@ PROTOCOL_TO_ID = {
 }
 
 
-def load_config(config_path: str) -> dict:
+FEATURE_NAMES = [
+    "packet_count",
+    "total_bytes",
+    "average_packet_size",
+    "packets_per_second",
+    "bytes_per_second",
+    "src_port",
+    "dst_port",
+    "unique_destinations",
+    "unique_destination_ports",
+    "protocol_id",
+]
+
+
+def load_config(path: str) -> dict:
     with open(
-        config_path,
+        path,
         "r",
         encoding="utf-8",
     ) as file:
         return yaml.safe_load(file)
-
-
-def load_training_csv(
-    csv_path: str,
-) -> np.ndarray:
-    """
-    Expected columns:
-
-        packet_size,
-        protocol_id,
-        src_port,
-        dst_port
-    """
-
-    rows: List[List[float]] = []
-
-    with open(
-        csv_path,
-        "r",
-        encoding="utf-8",
-    ) as file:
-
-        reader = csv.DictReader(file)
-
-        required = {
-            "packet_size",
-            "protocol_id",
-            "src_port",
-            "dst_port",
-        }
-
-        if not required.issubset(
-            reader.fieldnames or []
-        ):
-            raise ValueError(
-                "Training CSV must contain: "
-                "packet_size, protocol_id, "
-                "src_port, dst_port"
-            )
-
-        for row in reader:
-            rows.append(
-                [
-                    float(row["packet_size"]),
-                    float(row["protocol_id"]),
-                    float(row["src_port"]),
-                    float(row["dst_port"]),
-                ]
-            )
-
-    if not rows:
-        raise ValueError(
-            "Training CSV contains no rows."
-        )
-
-    return np.asarray(
-        rows,
-        dtype=np.float64,
-    )
 
 
 def generate_synthetic_normal_data(
@@ -119,37 +78,45 @@ def generate_synthetic_normal_data(
     random_state: int = 42,
 ) -> np.ndarray:
     """
-    Generate NORMAL network traffic.
-
-    The resulting distribution intentionally represents common
-    desktop/application traffic.
+    Generate approximate normal flow behavior.
     """
 
     rng = np.random.default_rng(
         random_state
     )
 
-    packet_size = np.clip(
-        rng.normal(
-            loc=700,
-            scale=220,
-            size=samples,
-        ),
+    packet_count = np.clip(
+        rng.normal(18, 7, samples),
+        1,
+        60,
+    )
+
+    average_packet_size = np.clip(
+        rng.normal(650, 180, samples),
         60,
         1500,
     )
 
-    protocol_id = rng.choice(
-        [
-            1, 1, 1, 1, 2, 6
-        ],
-        size=samples,
+    total_bytes = (
+        packet_count
+        * average_packet_size
+    )
+
+    packets_per_second = np.clip(
+        rng.normal(3.5, 1.2, samples),
+        0.2,
+        10,
+    )
+
+    bytes_per_second = (
+        packets_per_second
+        * average_packet_size
     )
 
     src_port = rng.integers(
         1024,
         65535,
-        size=samples,
+        samples,
     )
 
     dst_port = rng.choice(
@@ -161,21 +128,51 @@ def generate_synthetic_normal_data(
             443,
             22,
         ],
-        size=samples,
+        samples,
+    )
+
+    unique_destinations = np.clip(
+        rng.poisson(2, samples) + 1,
+        1,
+        10,
+    )
+
+    unique_destination_ports = np.clip(
+        rng.poisson(1, samples) + 1,
+        1,
+        6,
+    )
+
+    protocol_id = rng.choice(
+        [
+            1,
+            1,
+            1,
+            1,
+            2,
+            6,
+        ],
+        samples,
     )
 
     return np.column_stack(
         [
-            packet_size,
-            protocol_id,
+            packet_count,
+            total_bytes,
+            average_packet_size,
+            packets_per_second,
+            bytes_per_second,
             src_port,
             dst_port,
+            unique_destinations,
+            unique_destination_ports,
+            protocol_id,
         ]
-    ).astype(np.float64)
+    ).astype(float)
 
 
 def train_model(
-    training_data: np.ndarray,
+    data: np.ndarray,
     model_path: str,
     contamination: float,
     n_estimators: int,
@@ -184,14 +181,12 @@ def train_model(
 
     logger.info(
         "Training data shape: %s",
-        training_data.shape,
+        data.shape,
     )
 
     scaler = StandardScaler()
 
-    scaled_data = scaler.fit_transform(
-        training_data
-    )
+    scaled = scaler.fit_transform(data)
 
     model = IsolationForest(
         n_estimators=n_estimators,
@@ -200,21 +195,10 @@ def train_model(
         n_jobs=-1,
     )
 
-    model.fit(scaled_data)
+    model.fit(scaled)
 
-    # ------------------------------------------------------------------
-    # Calibrate threat-score boundaries.
-    #
-    # decision_function():
-    #     higher = more normal
-    #     lower  = more anomalous
-    #
-    # We save the normal distribution so inference can convert a score
-    # into a meaningful 0-100 range.
-    # ------------------------------------------------------------------
-
-    normal_scores = model.decision_function(
-        scaled_data
+    normal_scores = (
+        model.decision_function(scaled)
     )
 
     score_low = float(
@@ -231,63 +215,40 @@ def train_model(
         )
     )
 
-    model_bundle = {
+    bundle = {
         "model": model,
         "scaler": scaler,
-        "feature_names": [
-            "packet_size",
-            "protocol_id",
-            "src_port",
-            "dst_port",
-        ],
+        "feature_names": FEATURE_NAMES,
         "protocol_to_id": PROTOCOL_TO_ID,
         "normal_score_low": score_low,
         "normal_score_high": score_high,
     }
 
-    model_file = Path(
-        model_path
-    )
+    target = Path(model_path)
 
-    model_file.parent.mkdir(
+    target.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     joblib.dump(
-        model_bundle,
-        model_file,
+        bundle,
+        target,
     )
 
     logger.info(
         "Model saved to %s",
-        model_file,
-    )
-
-    logger.info(
-        "Normal score range: %.5f → %.5f",
-        score_low,
-        score_high,
+        target,
     )
 
 
 def main() -> None:
 
-    parser = argparse.ArgumentParser(
-        description=(
-            "Train the Zero-Trust "
-            "Isolation Forest model."
-        )
-    )
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--config",
         default="config.yaml",
-    )
-
-    parser.add_argument(
-        "--csv",
-        default=None,
     )
 
     args = parser.parse_args()
@@ -298,41 +259,16 @@ def main() -> None:
 
     model_config = config["model"]
 
-    if args.csv:
-        logger.info(
-            "Using CSV training data: %s",
-            args.csv,
-        )
-
-        training_data = load_training_csv(
-            args.csv
-        )
-
-    else:
-        logger.warning(
-            "No CSV supplied."
-        )
-
-        logger.warning(
-            "Using synthetic normal traffic."
-        )
-
-        training_data = (
-            generate_synthetic_normal_data()
-        )
+    data = (
+        generate_synthetic_normal_data()
+    )
 
     train_model(
-        training_data=training_data,
+        data=data,
         model_path=model_config["path"],
-        contamination=model_config[
-            "contamination"
-        ],
-        n_estimators=model_config[
-            "n_estimators"
-        ],
-        random_state=model_config[
-            "random_state"
-        ],
+        contamination=model_config["contamination"],
+        n_estimators=model_config["n_estimators"],
+        random_state=model_config["random_state"],
     )
 
 

@@ -1,5 +1,4 @@
 backend:
-  url: "https://YOUR-REMOTE-BACKEND-URL/api/alerts"
   timeout_seconds: 5
 
 sniffer:
@@ -8,10 +7,10 @@ sniffer:
   batch_size: 50
   batch_sleep_seconds: 0.05
   max_packet_size: 65535
+  window_seconds: 10
 
 model:
   path: "models/isolation_forest.joblib"
-
   contamination: 0.05
   n_estimators: 200
   random_state: 42
